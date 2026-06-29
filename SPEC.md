@@ -29,9 +29,9 @@ The service solves four operational problems:
 - It provides enough observability to operate and debug multiple concurrent agent runs.
 
 Implementations are expected to document their trust and safety posture explicitly. This
-specification does not require a single approval, sandbox, or operator-confirmation policy; some
-implementations target trusted environments with a high-trust configuration, while others require
-stricter approvals or sandboxing.
+specification does not require a single permission, sandbox/isolation, or operator-confirmation
+policy; some implementations target trusted environments with a high-trust configuration, while
+others require stricter permissions or sandboxing.
 
 Important boundary:
 
@@ -62,8 +62,8 @@ Important boundary:
 - General-purpose workflow engine or distributed job scheduler.
 - Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
   workflow prompt and agent tooling.)
-- Mandating strong sandbox controls beyond what the coding agent and host OS provide.
-- Mandating a single default approval, sandbox, or operator-confirmation posture for all
+- Mandating strong sandbox/isolation controls beyond what the coding agent and host OS provide.
+- Mandating a single default permission, sandbox/isolation, or operator-confirmation posture for all
   implementations.
 
 ## 3. System Overview
@@ -101,7 +101,7 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the opencode server client.
    - Streams agent updates back to the orchestrator.
 
 7. `Status Surface` (OPTIONAL)
@@ -140,7 +140,7 @@ Symphony is easiest to port when kept in these layers:
 - Issue tracker API (GitLab for `tracker.kind: gitlab` in this specification version).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
+- `opencode` executable with `opencode serve` support.
 - Host environment authentication for the issue tracker and coding agent.
 
 ## 4. Core Domain Model
@@ -224,20 +224,21 @@ Fields (logical):
 
 #### 4.1.6 Live Session (Agent Session Metadata)
 
-State tracked while a coding-agent subprocess is running.
+State tracked while an opencode server subprocess or external opencode server session is running.
 
 Fields:
 
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
-- `codex_app_server_pid` (string or null)
-- `last_codex_event` (string/enum or null)
-- `last_codex_timestamp` (timestamp or null)
-- `last_codex_message` (summarized payload)
-- `codex_input_tokens` (integer)
-- `codex_output_tokens` (integer)
-- `codex_total_tokens` (integer)
+- `session_id` (string)
+  - opencode session ID returned by `POST /session`.
+- `message_id` (string or null)
+  - Latest opencode message/prompt ID when exposed by the server response or event stream.
+- `opencode_server_pid` (string or null)
+- `last_opencode_event` (string/enum or null)
+- `last_opencode_timestamp` (timestamp or null)
+- `last_opencode_message` (summarized payload)
+- `opencode_input_tokens` (integer)
+- `opencode_output_tokens` (integer)
+- `opencode_total_tokens` (integer)
 - `last_reported_input_tokens` (integer)
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
@@ -269,8 +270,8 @@ Fields:
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
-- `codex_totals` (aggregate tokens + runtime seconds)
-- `codex_rate_limits` (latest rate-limit snapshot from agent events)
+- `opencode_totals` (aggregate tokens + runtime seconds)
+- `opencode_rate_limits` (latest rate-limit snapshot from agent events, if available)
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
@@ -284,7 +285,7 @@ Fields:
 - `Normalized Issue State`
   - Compare states after `lowercase`.
 - `Session ID`
-  - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
+  - Use the opencode session ID returned by `POST /session`.
 
 ## 5. Workflow Specification (Repository Contract)
 
@@ -332,7 +333,7 @@ Top-level keys:
 - `workspace`
 - `hooks`
 - `agent`
-- `codex`
+- `opencode`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -447,28 +448,50 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `opencode` (object)
 
 Fields:
 
-For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
-`turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
-Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
-hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
+For opencode-owned config values such as `model`, `agent`, `permission`, `mcp`, and `tools`,
+supported values are defined by the targeted opencode version. Implementors SHOULD treat
+`opencode.config` as a pass-through opencode config map rather than relying on a hand-maintained enum
+in this spec. To inspect the installed opencode HTTP schema, start `opencode serve` and open the
+server's `/doc` OpenAPI endpoint. Implementations MAY validate pass-through fields locally if they
+want stricter startup checks.
 
 - `command` (string shell command)
-  - Default: `codex app-server`
+  - Default: `opencode serve --hostname "$OPENCODE_HOST" --port "$OPENCODE_PORT"`
   - The runtime launches this command via `bash -lc` in the workspace directory.
-  - The launched process MUST speak a compatible app-server protocol over stdio.
-- `approval_policy` (Codex `AskForApproval` value)
-  - Default: implementation-defined.
-- `thread_sandbox` (Codex `SandboxMode` value)
-  - Default: implementation-defined.
-- `turn_sandbox_policy` (Codex `SandboxPolicy` value)
-  - Default: implementation-defined.
+  - The launched process MUST expose a compatible opencode HTTP server.
+  - The runtime MUST set `OPENCODE_HOST` and `OPENCODE_PORT` before launch.
+- `host` (string)
+  - Default: `127.0.0.1`
+  - Used for local opencode server binding and client base URL construction.
+- `port` (integer)
+  - Default: `0`
+  - `0` means Symphony allocates an available loopback port and passes it to the command through
+    `OPENCODE_PORT`.
+- `base_url` (string, OPTIONAL)
+  - When present, the runtime connects to this already-running opencode server instead of launching
+    `opencode.command`.
+  - Implementations MUST document whether per-issue workspace isolation is still enforced for an
+    external server.
+- `config` (object, OPTIONAL)
+  - Pass-through opencode configuration. Implementations MAY materialize it as an opencode config
+    file, apply it through the opencode HTTP config API, or document another equivalent mechanism.
+- `agent` (string, OPTIONAL)
+  - opencode agent name to send with each prompt/message when supported.
+- `model` (object or string, OPTIONAL)
+  - opencode model selection to send with each prompt/message when supported.
+- `permission` (object or string, OPTIONAL)
+  - Convenience alias for opencode permission configuration. If both `opencode.config.permission` and
+    `opencode.permission` are present, `opencode.config.permission` takes precedence.
+- `auth_username` (string or `$VAR`, OPTIONAL)
+  - Used only when the opencode server is protected with HTTP Basic authentication.
+- `auth_password` (string or `$VAR`, OPTIONAL)
+  - Used only when the opencode server is protected with HTTP Basic authentication.
+  - If launching a local server, implementations MAY pass this through as
+    `OPENCODE_SERVER_PASSWORD`.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -552,7 +575,7 @@ Dynamic reload is REQUIRED:
 - The software MUST detect `WORKFLOW.md` changes.
 - On change, it MUST re-read and re-apply workflow config and prompt template without restart.
 - The software MUST attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
+  cadence, concurrency limits, active/terminal states, opencode settings, workspace paths/hooks, and
   prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
   execution, and agent launches.
@@ -588,7 +611,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
 - `tracker.project_id` is present when REQUIRED by the selected tracker kind.
-- `codex.command` is present and non-empty.
+- `opencode.command` is present and non-empty unless `opencode.base_url` is configured.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -616,13 +639,20 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
-- `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
-- `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
-- `codex.stall_timeout_ms`: integer, default `300000`
+- `opencode.command`: shell command string, default
+  `opencode serve --hostname "$OPENCODE_HOST" --port "$OPENCODE_PORT"`
+- `opencode.host`: string, default `127.0.0.1`
+- `opencode.port`: integer, default `0`
+- `opencode.base_url`: string or null, default null
+- `opencode.config`: pass-through opencode config object, default null
+- `opencode.agent`: string or null, default implementation-defined
+- `opencode.model`: object/string or null, default implementation-defined
+- `opencode.permission`: object/string or null, default implementation-defined
+- `opencode.auth_username`: string or `$VAR`, default null
+- `opencode.auth_password`: string or `$VAR`, default null
+- `opencode.turn_timeout_ms`: integer, default `3600000`
+- `opencode.read_timeout_ms`: integer, default `5000`
+- `opencode.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
 
@@ -657,10 +687,10 @@ Important nuance:
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
 - If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+  opencode session in the same workspace, up to `agent.max_turns`.
 - The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
+- Continuation turns SHOULD send only continuation guidance to the existing session, not resend the
+  original task prompt that is already present in session history.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
@@ -702,7 +732,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
+- `opencode Event`
   - Update live session fields, token counters, and rate limits.
 
 - `Retry Timer Fired`
@@ -814,9 +844,9 @@ Reconciliation runs every tick and has two parts.
 Part A: Stall detection
 
 - For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
+  - `last_opencode_timestamp` if any event has been seen, else
   - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
+- If `elapsed_ms > opencode.stall_timeout_ms`, terminate the worker and queue a retry.
 - If `stall_timeout_ms <= 0`, skip stall detection entirely.
 
 Part B: Tracker state refresh
@@ -936,101 +966,119 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
+This section defines Symphony's language-neutral responsibilities when integrating opencode. The
+targeted opencode `serve` HTTP API is the source of truth for protocol schemas, request/response
+payloads, event payloads, and method names.
 
 Protocol source of truth:
 
-- Implementations MUST send messages that are valid for the targeted Codex app-server version.
-- Implementations MUST consult the targeted Codex app-server documentation or generated schema
-  instead of treating this specification as a protocol schema.
-- If this specification appears to conflict with the targeted Codex app-server protocol, the Codex
-  protocol controls protocol shape and transport behavior.
+- Implementations MUST send HTTP requests that are valid for the targeted opencode version.
+- Implementations MUST consult the targeted opencode documentation or the running server's `/doc`
+  OpenAPI schema instead of treating this specification as an opencode protocol schema.
+- If this specification appears to conflict with the targeted opencode HTTP API, the opencode API
+  controls protocol shape and transport behavior.
 - Symphony-specific requirements in this section still control orchestration behavior, workspace
   selection, prompt construction, continuation handling, and observability extraction.
+
+Reference: https://opencode.ai/docs/server/
 
 ### 10.1 Launch Contract
 
 Subprocess launch parameters:
 
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
+- Command: `opencode.command` unless `opencode.base_url` is configured.
+- Invocation: `bash -lc <opencode.command>`
 - Working directory: workspace path
-- Transport/framing: the protocol transport required by the targeted Codex app-server version
+- Transport/framing: HTTP JSON requests plus opencode Server-Sent Events (SSE) streams when streaming
+  updates are consumed.
 
 Notes:
 
-- The default command is `codex app-server`.
-- Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
-  using fields supported by the targeted Codex app-server version.
+- The default command is `opencode serve --hostname "$OPENCODE_HOST" --port "$OPENCODE_PORT"`.
+- The runtime MUST set `OPENCODE_HOST` from `opencode.host`.
+- The runtime MUST set `OPENCODE_PORT` from `opencode.port`, allocating a free loopback port first
+  when `opencode.port == 0`.
+- The opencode client base URL is `http://<OPENCODE_HOST>:<OPENCODE_PORT>` unless
+  `opencode.base_url` is configured.
+- If `opencode.base_url` is configured, Symphony connects to an already-running opencode server and
+  does not launch or own the server process.
+- opencode config, model selection, agent selection, permission behavior, and tool/MCP setup are
+  supplied using fields supported by the targeted opencode version.
 
-RECOMMENDED additional process settings:
+RECOMMENDED additional process/client settings:
 
-- Max line size: 10 MB (for safe buffering)
+- Max HTTP response/event payload size: 10 MB (for safe buffering)
+- Readiness timeout: use `opencode.read_timeout_ms` unless the implementation documents a separate
+  startup timeout.
 
 ### 10.2 Session Startup Responsibilities
 
-Reference: https://developers.openai.com/codex/app-server/
-
-Startup MUST follow the targeted Codex app-server contract. Symphony additionally requires the
+Startup MUST follow the targeted opencode HTTP API contract. Symphony additionally requires the
 client to:
 
-- Start the app-server subprocess in the per-issue workspace.
-- Initialize the app-server session using the targeted Codex app-server protocol.
-- Create or resume a coding-agent thread according to the targeted protocol.
-- Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
-  targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
-- Start later in-worker continuation turns on the same live thread with continuation guidance rather
-  than resending the original issue prompt.
-- Supply the implementation's documented approval and sandbox policy using fields supported by the
-  targeted protocol.
-- Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
-  protocol supports turn or session titles.
-- Advertise implemented client-side tools using the targeted protocol.
+- Start the opencode server subprocess in the per-issue workspace, unless `opencode.base_url` is
+  configured.
+- Wait for the server to become ready, using `GET /global/health` or the targeted version's
+  equivalent health endpoint.
+- Apply `opencode.config` through a documented mechanism before the first prompt is sent.
+- Create a coding-agent session with `POST /session`.
+- Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when creating the
+  session or setting its title.
+- Open the opencode event stream (`GET /event` or `GET /global/event`, according to the targeted
+  API) when the implementation needs streaming updates.
+- Start the first turn by sending the rendered issue prompt to the opencode session.
+- Start later in-worker continuation turns by sending continuation guidance to the same opencode
+  session rather than resending the original issue prompt.
+- Supply configured model and agent values in prompt/message requests when the targeted opencode API
+  supports those fields.
+- Send HTTP Basic authentication when `opencode.auth_username` or `opencode.auth_password` is
+  configured.
 
 Session identifiers:
 
-- Extract `thread_id` from the thread identity returned by the targeted Codex app-server protocol.
-- Extract `turn_id` from each turn identity returned by the targeted Codex app-server protocol.
-- Emit `session_id = "<thread_id>-<turn_id>"`
-- Reuse the same `thread_id` for all continuation turns inside one worker run
+- Extract `session_id` from the session identity returned by `POST /session`.
+- Extract `message_id` from each prompt/message response or event payload when available.
+- Emit `session_id` using the opencode session ID.
+- Reuse the same `session_id` for all continuation turns inside one worker run.
 
 ### 10.3 Streaming Turn Processing
 
-The client processes app-server updates according to the targeted Codex app-server protocol until
-the active turn terminates.
+The client sends prompts using the targeted opencode message API, normally `POST
+/session/:id/message` with text prompt parts. An implementation MAY use the targeted version's async
+prompt endpoint if it correlates the submitted prompt with SSE updates and terminal completion.
+
+The client processes opencode HTTP responses and, when enabled, SSE updates until the active turn
+terminates.
 
 Completion conditions:
 
-- Targeted-protocol turn completion signal -> success
+- Successful synchronous message response, or targeted-protocol terminal completion event -> success
+- Non-2xx HTTP response or protocol error -> failure
 - Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
+- Targeted-protocol cancellation/abort signal -> failure
 - turn timeout (`turn_timeout_ms`) -> failure
-- subprocess exit -> failure
+- opencode server process exit -> failure
 
 Continuation processing:
 
-- If the worker decides to continue after a successful turn, it SHOULD start another turn on the same
-  live thread using the targeted protocol.
-- The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
-  when the worker run is ending.
+- If the worker decides to continue after a successful turn, it SHOULD send another prompt to the same
+  live opencode session.
+- The opencode server subprocess SHOULD remain alive across those continuation turns and be stopped
+  only when the worker run is ending.
 
 Transport handling requirements:
 
-- Follow the transport and framing rules of the targeted Codex app-server version.
-- For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
-  handling unless the targeted protocol specifies otherwise.
+- Follow the HTTP request/response, SSE framing, and authentication rules of the targeted opencode
+  version.
+- Keep opencode server stdout/stderr diagnostic handling separate from HTTP/SSE protocol handling.
 
 ### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
-include:
+The opencode client emits structured events to the orchestrator callback. Each event SHOULD include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
+- `opencode_server_pid` (if available)
 - OPTIONAL `usage` map (token counts)
 - payload fields as needed
 
@@ -1043,46 +1091,50 @@ Important emitted events include, for example:
 - `turn_cancelled`
 - `turn_ended_with_error`
 - `turn_input_required`
-- `approval_auto_approved`
+- `permission_requested`
+- `permission_resolved`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
 - `malformed`
 
-### 10.5 Approval, Tool Calls, and User Input Policy
+### 10.5 Permissions, Tool Calls, and User Input Policy
 
-Approval, sandbox, and user-input behavior is implementation-defined.
+Permission, tool-call, sandbox/isolation, and user-input behavior is implementation-defined.
 
 Policy requirements:
 
-- Each implementation MUST document its chosen approval, sandbox, and operator-confirmation
-  posture.
-- Approval requests and user-input-required events MUST NOT leave a run stalled indefinitely. An
-  implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
-  fail the run according to its documented policy.
+- Each implementation MUST document its chosen opencode permission, host sandbox/isolation, and
+  operator-confirmation posture.
+- Permission requests and user-input-required events MUST NOT leave a run stalled indefinitely. An
+  implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or fail the
+  run according to its documented policy.
+- opencode permission requests that use `ask` behavior SHOULD be answered through the targeted
+  version's permission response endpoint, normally `POST /session/:id/permissions/:permissionID`.
 
 Example high-trust behavior:
 
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
+- Configure opencode permissions to allow command execution and file edits for the session.
+- Auto-resolve supported permission requests according to a documented allowlist.
 - Treat user-input-required turns as hard failure.
 
 Unsupported dynamic tool calls:
 
-- Supported dynamic tool calls that are explicitly implemented and advertised by the runtime SHOULD
-  be handled according to their extension contract.
-- If the agent requests a dynamic tool call that is not supported, return a tool failure response
-  using the targeted protocol and continue the session.
+- Tools and MCP servers that Symphony wants opencode to use SHOULD be configured before the first
+  prompt through opencode config, plugins, or another mechanism supported by the targeted opencode
+  version.
+- If the agent requests a tool call that is not supported, return or surface a tool failure response
+  using the opencode mechanism available in the targeted version.
 - This prevents the session from stalling on unsupported tool execution paths.
 
 Optional client-side tool extension:
 
-- An implementation MAY expose a limited set of client-side tools to the app-server session.
+- An implementation MAY expose a limited set of tools to opencode.
 - Current standardized optional tool: `gitlab_api`.
-- If implemented, supported tools SHOULD be advertised to the app-server session during startup
-  using the protocol mechanism supported by the targeted Codex app-server version.
-- Unsupported tool names SHOULD still return a failure result using the targeted protocol and
-  continue the session.
+- If implemented, supported tools SHOULD be exposed as opencode-compatible tools, MCP servers, or
+  plugins before the first prompt.
+- Unsupported tool names SHOULD still return a failure result using the targeted opencode mechanism
+  and continue the session where possible.
 
 `gitlab_api` extension contract:
 
@@ -1119,42 +1171,46 @@ Optional client-side tool extension:
 
 User-input-required policy:
 
-- Implementations MUST document how targeted-protocol user-input-required signals are handled.
+- Implementations MUST document how targeted opencode user-input-required signals are handled.
 - A run MUST NOT stall indefinitely waiting for user input.
 - A conforming implementation MAY fail the run, surface the request to an operator, satisfy it
-  through an approved operator channel, or auto-resolve it according to its documented policy.
+  through a documented operator channel, or auto-resolve it according to its documented policy.
 - The example high-trust behavior above fails user-input-required turns immediately.
 
 ### 10.6 Timeouts and Error Mapping
 
 Timeouts:
 
-- `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
+- `opencode.read_timeout_ms`: request/response timeout during startup and sync requests
+- `opencode.turn_timeout_ms`: total turn stream timeout
+- `opencode.stall_timeout_ms`: enforced by orchestrator based on event inactivity
 
 Error mapping (RECOMMENDED normalized categories):
 
-- `codex_not_found`
+- `opencode_not_found`
 - `invalid_workspace_cwd`
+- `health_timeout`
 - `response_timeout`
 - `turn_timeout`
-- `port_exit`
+- `server_exit`
+- `http_error`
+- `sse_error`
 - `response_error`
 - `turn_failed`
 - `turn_cancelled`
 - `turn_input_required`
+- `permission_denied`
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + opencode server client.
 
 Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
+3. Start/connect opencode server session.
+4. Forward opencode events to orchestrator.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
@@ -1339,7 +1395,7 @@ SHOULD return:
 - each running row SHOULD include `turn_count`
 - `retrying` (list of retry queue rows)
 - session and retry rows SHOULD include the tracker-provided issue URL when available
-- `codex_totals`
+- `opencode_totals`
   - `input_tokens`
   - `output_tokens`
   - `total_tokens`
@@ -1364,9 +1420,9 @@ correctness.
 Token accounting rules:
 
 - Agent events can include token counts in multiple payload shapes.
-- Prefer absolute thread totals when available, such as:
-  - `thread/tokenUsage/updated` payloads
-  - `total_token_usage` within token-count wrapper events
+- Prefer absolute session/message totals when available, such as:
+  - opencode usage fields attached to session/message responses or events
+  - `total_token_usage` within token-count wrapper events, when exposed by the targeted version
 - Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
 - Extract input/output/total token counts leniently from common field names within the selected
   payload.
@@ -1460,7 +1516,7 @@ Minimum endpoints:
           "issue_identifier": "#123",
           "issue_url": "https://gitlab.example.com/group/project/-/issues/123",
           "state": "In Progress",
-          "session_id": "thread-1-turn-1",
+          "session_id": "ses_123",
           "turn_count": 7,
           "last_event": "turn_completed",
           "last_message": "",
@@ -1483,7 +1539,7 @@ Minimum endpoints:
           "error": "no available orchestrator slots"
         }
       ],
-      "codex_totals": {
+      "opencode_totals": {
         "input_tokens": 5000,
         "output_tokens": 2400,
         "total_tokens": 7400,
@@ -1511,7 +1567,7 @@ Minimum endpoints:
         "current_retry_attempt": 2
       },
       "running": {
-        "session_id": "thread-1-turn-1",
+        "session_id": "ses_123",
         "turn_count": 7,
         "state": "In Progress",
         "started_at": "2026-02-24T20:10:12Z",
@@ -1526,10 +1582,10 @@ Minimum endpoints:
       },
       "retry": null,
       "logs": {
-        "codex_session_logs": [
+        "opencode_session_logs": [
           {
             "label": "latest",
-            "path": "/var/log/symphony/codex/_123/latest.log",
+            "path": "/var/log/symphony/opencode/_123/latest.log",
             "url": null
           }
         ]
@@ -1669,10 +1725,10 @@ Operational safety requirements:
 
 - Implementations SHOULD state clearly whether they are intended for trusted environments, more
   restrictive environments, or both.
-- Implementations SHOULD state clearly whether they rely on auto-approved actions, operator
-  approvals, stricter sandboxing, or some combination of those controls.
+- Implementations SHOULD state clearly whether they rely on auto-allowed actions, operator
+  confirmations, stricter sandboxing, or some combination of those controls.
 - Workspace isolation and path validation are important baseline controls, but they are not a
-  substitute for whatever approval and sandbox policy an implementation chooses.
+  substitute for whatever permission and host isolation policy an implementation chooses.
 
 ### 15.2 Filesystem Safety Requirements
 
@@ -1707,7 +1763,7 @@ Implications:
 
 ### 15.5 Harness Hardening Guidance
 
-Running Codex agents against repositories, issue trackers, and other inputs that can contain
+Running opencode agents against repositories, issue trackers, and other inputs that can contain
 sensitive data or externally-controlled content can be dangerous. A permissive deployment can lead
 to data leaks, destructive mutations, or full machine compromise if the agent is induced to execute
 harmful commands or use overly-powerful integrations.
@@ -1719,10 +1775,10 @@ arguments are fully trustworthy just because they originate inside a normal work
 
 Possible hardening measures include:
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
-  of running with a maximally permissive configuration.
+- Tightening opencode permission settings and host sandboxing described elsewhere in this
+  specification instead of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
+  separate credentials beyond opencode's built-in permission controls.
 - Filtering which GitLab issues, projects, groups, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the `gitlab_api` tool so it can only read or mutate data inside the
@@ -1750,8 +1806,8 @@ function start_service():
     claimed: set(),
     retry_attempts: {},
     completed: set(),
-    codex_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
-    codex_rate_limits: null
+    opencode_totals: {input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+    opencode_rate_limits: null
   }
 
   validation = validate_dispatch_config()
@@ -1843,13 +1899,13 @@ function dispatch_issue(issue, state, attempt):
     identifier: issue.identifier,
     issue,
     session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
+    opencode_server_pid: null,
+    last_opencode_message: null,
+    last_opencode_event: null,
+    last_opencode_timestamp: null,
+    opencode_input_tokens: 0,
+    opencode_output_tokens: 0,
+    opencode_total_tokens: 0,
     last_reported_input_tokens: 0,
     last_reported_output_tokens: 0,
     last_reported_total_tokens: 0,
@@ -1873,7 +1929,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  session = opencode.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1884,25 +1940,25 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      opencode.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = opencode.run_turn(
       session=session,
       prompt=prompt,
       issue=issue,
-      on_message=(msg) -> send(orchestrator_channel, {codex_update, issue.id, msg})
+      on_message=(msg) -> send(orchestrator_channel, {opencode_update, issue.id, msg})
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      opencode.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      opencode.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1916,7 +1972,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  opencode.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()
@@ -2004,7 +2060,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
-- `codex.command` is preserved as a shell command string
+- `opencode.command` is preserved as a shell command string
 - Per-state concurrency override map normalizes state names and ignores invalid values
 - Prompt template renders `issue` and `attempt`
 - Prompt rendering fails on unknown variables (strict mode)
@@ -2056,30 +2112,30 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
 
-### 17.5 Coding-Agent App-Server Client
+### 17.5 opencode Server Client
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
-- Session startup follows the targeted Codex app-server protocol.
-- Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
-  them.
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- Thread and turn identities exposed by the targeted protocol are extracted and used to emit
-  `session_started`
+- Launch command uses workspace cwd and invokes `bash -lc <opencode.command>`, unless
+  `opencode.base_url` is configured.
+- The local client waits for opencode readiness with the targeted health endpoint.
+- Session startup follows the targeted opencode HTTP API.
+- Config/model/agent/permission payloads are valid when the targeted opencode API requires them.
+- opencode session identities exposed by the targeted protocol are extracted and used to emit
+  `session_started`.
 - Request/response read timeout is enforced
 - Turn timeout is enforced
-- Transport framing required by the targeted protocol is handled correctly
-- For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
-- Command/file-change approvals are handled according to the implementation's documented policy
+- HTTP and SSE transport framing required by the targeted protocol is handled correctly
+- opencode stdout/stderr diagnostics are kept separate from HTTP/SSE protocol handling
+- Command/file-change permissions are handled according to the implementation's documented policy
 - Unsupported dynamic tool calls are rejected without stalling the session
 - User input requests are handled according to the implementation's documented policy and do not
   stall indefinitely
 - Usage and rate-limit telemetry exposed by the targeted protocol is extracted
-- Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
+- Permission, user-input-required, usage, and rate-limit signals are interpreted according to the
   targeted protocol
-- If client-side tools are implemented, session startup advertises the supported tool specs
-  using the targeted app-server protocol
+- If client-side tools are implemented, they are exposed through opencode-compatible tools, MCP
+  servers, or plugins before the first prompt.
 - If the `gitlab_api` client-side tool extension is implemented:
-  - the tool is advertised to the session
+  - the tool is exposed to the session
   - valid `method` / `path` / `query` / `body` inputs execute against configured GitLab auth
   - non-2xx HTTP responses produce `success=false` while preserving the response body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
@@ -2137,8 +2193,9 @@ Use the same validation profiles as Section 17:
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with JSON line protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
+- opencode server subprocess/external-server client with HTTP/SSE protocol handling
+- opencode launch command config (`opencode.command`, default
+  `opencode serve --hostname "$OPENCODE_HOST" --port "$OPENCODE_PORT"`)
 - Strict prompt rendering with `issue` and `attempt` variables
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
@@ -2151,8 +2208,8 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `gitlab_api` client-side tool extension exposes raw GitLab REST access through the
-  app-server session using configured Symphony auth.
+- `gitlab_api` client-side tool extension exposes raw GitLab REST access through an
+  opencode-compatible tool/MCP/plugin using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
@@ -2187,11 +2244,12 @@ Extension config:
 - Each worker run is assigned to one host at a time, and that host becomes part of the run's
   effective execution identity along with the issue workspace.
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
+- The opencode server is launched on the remote host instead of as a local subprocess. The
+  orchestrator still owns the session lifecycle through an SSH command channel, SSH port forward, or
+  another documented transport that preserves the opencode HTTP/SSE contract.
 - Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
 - A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
-  shell, writable workspace root, coding-agent executable, and any required auth or repository
+  shell, writable workspace root, opencode executable, and any required auth or repository
   prerequisites.
 
 ### A.2 Scheduling Notes
