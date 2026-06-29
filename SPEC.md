@@ -16,7 +16,7 @@ behavior.
 ## 1. Problem Statement
 
 Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
+(GitLab in this specification version), creates an isolated workspace for each issue, and runs a
 coding agent session for that issue inside the workspace.
 
 The service solves four operational problems:
@@ -129,7 +129,7 @@ Symphony is easiest to port when kept in these layers:
 4. `Execution Layer` (workspace + agent subprocess)
    - Filesystem lifecycle, workspace preparation, coding-agent protocol.
 
-5. `Integration Layer` (Linear adapter)
+5. `Integration Layer` (GitLab adapter)
    - API calls and normalization for tracker data.
 
 6. `Observability Layer` (logs + OPTIONAL status surface)
@@ -137,7 +137,7 @@ Symphony is easiest to port when kept in these layers:
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
+- Issue tracker API (GitLab for `tracker.kind: gitlab` in this specification version).
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
 - Coding-agent executable that supports the targeted Codex app-server mode.
@@ -349,15 +349,33 @@ Fields:
 
 - `kind` (string)
   - REQUIRED for dispatch.
-  - Current supported value: `linear`
+  - Current supported value: `gitlab`
 - `endpoint` (string)
-  - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
+  - Default for `tracker.kind == "gitlab"`: `https://gitlab.com/api/v4`
+  - The endpoint is the REST API base URL (no trailing slash required). For self-hosted GitLab,
+    set this to `https://gitlab.example.com/api/v4`.
 - `api_key` (string)
   - MAY be a literal token or `$VAR_NAME`.
-  - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
+  - Canonical environment variable for `tracker.kind == "gitlab"`: `GITLAB_TOKEN`.
+  - The token is a GitLab Personal Access Token (or job token) sent as the `PRIVATE-TOKEN` header
+    (or `Authorization: Bearer <token>` for OAuth/job tokens).
   - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
-- `project_slug` (string)
-  - REQUIRED for dispatch when `tracker.kind == "linear"`.
+- `project_id` (string or integer)
+  - REQUIRED for dispatch when `tracker.kind == "gitlab"`.
+  - Accepts either the GitLab numeric project ID or the URL-encoded full project path
+    (for example `group%2Fproject`).
+- `assignee` (string, OPTIONAL)
+  - Username or numeric user ID used for assignee-based routing (see Section 8.2).
+  - When unset, assignee routing is not applied.
+- `state_label_prefix` (string, OPTIONAL)
+  - Default: `Status::`.
+  - GitLab issues have only the native states `opened` and `closed`. Workflow states
+    (for example `Todo`, `In Progress`, `Human Review`, `Done`) are modeled as scoped labels.
+  - The adapter scans issue labels for exactly one label starting with this prefix and uses the
+    suffix (after the prefix) as the normalized workflow `issue.state`. Native `closed` always
+    maps to terminal state `closed` regardless of labels.
+  - When no label matches the prefix, `issue.state` falls back to the native state
+    (`opened` or `closed`).
 - `required_labels` (list of strings)
   - Default: `[]`.
   - An issue MUST contain every configured label to dispatch or continue.
@@ -465,7 +483,10 @@ The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
 
 Rendering requirements:
 
-- Use a strict template engine (Liquid-compatible semantics are sufficient).
+- Use a strict template engine.
+- The reference template syntax for `WORKFLOW.md` is Liquid. Implementations SHOULD accept
+  Liquid-compatible syntax so that workflow files stay portable across implementations; an
+  implementation MAY additionally support other strict template syntaxes.
 - Unknown variables MUST fail rendering.
 - Unknown filters MUST fail rendering.
 
@@ -480,7 +501,7 @@ Template input variables:
 Fallback prompt behavior:
 
 - If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+  (`You are working on an issue from GitLab.`).
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
@@ -566,7 +587,7 @@ Validation checks:
 - Workflow file can be loaded and parsed.
 - `tracker.kind` is present and supported.
 - `tracker.api_key` is present after `$` resolution.
-- `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
+- `tracker.project_id` is present when REQUIRED by the selected tracker kind.
 - `codex.command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
@@ -575,10 +596,12 @@ This section is intentionally redundant so a coding agent can implement the conf
 Extension fields are documented in the extension section that defines them. Core conformance does
 not require recognizing or validating extension fields unless that extension is implemented.
 
-- `tracker.kind`: string, REQUIRED, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
+- `tracker.kind`: string, REQUIRED, currently `gitlab`
+- `tracker.endpoint`: string, default `https://gitlab.com/api/v4` when `tracker.kind=gitlab`
+- `tracker.api_key`: string or `$VAR`, canonical env `GITLAB_TOKEN` when `tracker.kind=gitlab`
+- `tracker.project_id`: string or integer, REQUIRED when `tracker.kind=gitlab`
+- `tracker.assignee`: string or null, default null
+- `tracker.state_label_prefix`: string, default `Status::`
 - `tracker.required_labels`: list of strings, default `[]`
 - `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
 - `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
@@ -1055,43 +1078,43 @@ Unsupported dynamic tool calls:
 Optional client-side tool extension:
 
 - An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
+- Current standardized optional tool: `gitlab_api`.
 - If implemented, supported tools SHOULD be advertised to the app-server session during startup
   using the protocol mechanism supported by the targeted Codex app-server version.
 - Unsupported tool names SHOULD still return a failure result using the targeted protocol and
   continue the session.
 
-`linear_graphql` extension contract:
+`gitlab_api` extension contract:
 
-- Purpose: execute a raw GraphQL query or mutation against Linear using Symphony's configured
-  tracker auth for the current session.
-- Availability: only meaningful when `tracker.kind == "linear"` and valid Linear auth is configured.
+- Purpose: execute a single GitLab REST v4 API call using Symphony's configured tracker auth for the
+  current session.
+- Availability: only meaningful when `tracker.kind == "gitlab"` and valid GitLab auth is configured.
 - Preferred input shape:
 
   ```json
   {
-    "query": "single GraphQL query or mutation document",
-    "variables": {
-      "optional": "graphql variables object"
-    }
+    "method": "GET",
+    "path": "/projects/:id/issues",
+    "query": {"optional": "query parameters object"},
+    "body": {"optional": "json request body"}
   }
   ```
 
-- `query` MUST be a non-empty string.
-- `query` MUST contain exactly one GraphQL operation.
-- `variables` is OPTIONAL and, when present, MUST be a JSON object.
-- Implementations MAY additionally accept a raw GraphQL query string as shorthand input.
-- Execute one GraphQL operation per tool call.
-- If the provided document contains multiple operations, reject the tool call as invalid input.
-- `operationName` selection is intentionally out of scope for this extension.
-- Reuse the configured Linear endpoint and auth from the active Symphony workflow/runtime config; do
+- `method` MUST be one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE` (case-insensitive).
+- `path` MUST be a non-empty string starting with `/` and is appended to the configured
+  `tracker.endpoint` base URL. URL path parameters (for example `:id` or `:iid`) MUST be supplied
+  already substituted by the caller.
+- `query` is OPTIONAL and, when present, MUST be a JSON object of string/number/array values.
+- `body` is OPTIONAL and, when present, MUST be a JSON object. It is ignored for `GET`/`DELETE`.
+- Execute exactly one REST call per tool call.
+- Implementations MAY additionally accept a relative path string as shorthand for `GET` input.
+- Reuse the configured GitLab endpoint and auth from the active Symphony workflow/runtime config; do
   not require the coding agent to read raw tokens from disk.
 - Tool result semantics:
-  - transport success + no top-level GraphQL `errors` -> `success=true`
-  - top-level GraphQL `errors` present -> `success=false`, but preserve the GraphQL response body
-    for debugging
+  - transport success + 2xx HTTP status -> `success=true`
+  - non-2xx HTTP status -> `success=false`, but preserve the response body for debugging
   - invalid input, missing auth, or transport failure -> `success=false` with an error payload
-- Return the GraphQL response or error payload as structured tool output that the model can inspect
+- Return the REST response body or error payload as structured tool output that the model can inspect
   in-session.
 
 User-input-required policy:
@@ -1138,7 +1161,7 @@ Note:
 
 - Workspaces are intentionally preserved after successful runs.
 
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
+## 11. Issue Tracker Integration Contract (GitLab-Compatible)
 
 ### 11.1 REQUIRED Operations
 
@@ -1153,29 +1176,39 @@ An implementation MUST support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
-### 11.2 Query Semantics (Linear)
+### 11.2 Query Semantics (GitLab)
 
-Linear-specific requirements for `tracker.kind == "linear"`:
+GitLab-specific requirements for `tracker.kind == "gitlab"`:
 
-- `tracker.kind == "linear"`
-- GraphQL endpoint (default `https://api.linear.app/graphql`)
-- Auth token sent in `Authorization` header
-- `tracker.project_slug` maps to Linear project `slugId`
-- Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
-- Candidate and issue-state refresh queries include issue labels. Required
-  label filtering happens after normalization so refresh can observe label
-  removal and stop or release existing work.
-- Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
+- `tracker.kind == "gitlab"`
+- REST API v4 endpoint (default `https://gitlab.com/api/v4`)
+- Auth token sent in the `PRIVATE-TOKEN` header (Personal Access Token). Implementations MAY
+  alternatively send `Authorization: Bearer <token>` for OAuth or CI job tokens.
+- `tracker.project_id` maps to the GitLab project identifier; it is passed as the `:id` path
+  segment and accepts either the numeric project ID or the URL-encoded full project path.
+- Candidate issue fetch: `GET /projects/:id/issues?state=opened&scope=all&per_page=100&page=N`
+  - The adapter resolves the workflow `issue.state` from scoped labels using
+    `tracker.state_label_prefix` (see Section 5.3.1).
+  - Required-label filtering happens after normalization so refresh can observe label removal and
+    stop or release existing work.
+- Issue-state refresh: `GET /projects/:id/issues?iids[]=<iid>` for batched project-scoped refresh.
+  The adapter resolves `issue.id` to the corresponding `iid` from its in-memory snapshot. When the
+  running set is small, implementations MAY instead issue per-issue `GET /projects/:id/issues/:iid`.
+- Terminal-state fetch (startup cleanup): for native `closed`, use
+  `GET /projects/:id/issues?state=closed`; for workflow-label terminal states, query by
+  `labels=<prefix><suffix>` and merge results.
 - Pagination REQUIRED for candidate issues
-- Page size default: `50`
+- Page size default: `100` (GitLab maximum)
 - Network timeout: `30000 ms`
+- Rate limiting: GitLab returns `Ratelimit-*` headers and HTTP 429 on exhaustion. The adapter
+  SHOULD treat 429 as a transient transport failure and rely on orchestrator retry/backoff.
 
 Important:
 
-- Linear GraphQL schema details can drift. Keep query construction isolated and test the exact query
-  fields/types REQUIRED by this specification.
+- GitLab REST API field names and response shapes can drift between server versions. Keep request
+  construction isolated and test the exact fields REQUIRED by this specification.
 
-A non-Linear implementation MAY change transport details, but the normalized outputs MUST match the
+A non-GitLab implementation MAY change transport details, but the normalized outputs MUST match the
 domain model in Section 4.
 
 ### 11.3 Normalization Rules
@@ -1184,11 +1217,20 @@ Candidate issue normalization SHOULD produce fields listed in Section 4.1.1.
 
 Additional normalization details:
 
+- `id` -> the GitLab global issue `id` (stringified integer). Stable tracker-internal ID.
+- `identifier` -> `#<iid>` (project-scoped, human-readable).
+- `state` -> the derived workflow state from scoped labels using `tracker.state_label_prefix`; if
+  no label matches, fall back to the native `opened`/`closed` (lowercased).
 - Label names are trimmed and lowercased.
 
 - `labels` -> lowercase strings
-- `blocked_by` -> derived from inverse relations where relation type is `blocks`
-- `priority` -> integer only (non-integers become null)
+- `blocked_by` -> derived from issue links (`GET /projects/:id/issues/:iid/links`) where
+  `link_type` is `is_blocked_by`; each blocker ref carries the linked issue's `id`,
+  `identifier` (`#<iid>`), and derived `state`.
+- `priority` -> GitLab issues have no native integer priority; normalize to null (implementations
+  MAY derive from a scoped label, but that is implementation-defined and out of scope here).
+- `branch_name` -> GitLab issues have no single native branch metadata field; normalize to null
+  unless the implementation derives one from issue references.
 - `created_at` and `updated_at` -> parse ISO-8601 timestamps
 
 ### 11.4 Error Handling Contract
@@ -1197,12 +1239,12 @@ RECOMMENDED error categories:
 
 - `unsupported_tracker_kind`
 - `missing_tracker_api_key`
-- `missing_tracker_project_slug`
-- `linear_api_request` (transport failures)
-- `linear_api_status` (non-200 HTTP)
-- `linear_graphql_errors`
-- `linear_unknown_payload`
-- `linear_missing_end_cursor` (pagination integrity error)
+- `missing_tracker_project_id`
+- `gitlab_api_request` (transport failures)
+- `gitlab_api_status` (non-2xx HTTP, including 429 rate limit)
+- `gitlab_api_error` (error response body present)
+- `gitlab_unknown_payload`
+- `gitlab_pagination_error` (missing/invalid pagination metadata)
 
 Orchestrator behavior on tracker errors:
 
@@ -1219,7 +1261,7 @@ Symphony does not require first-class tracker write APIs in the orchestrator.
 - The service remains a scheduler/runner and tracker reader.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
-- If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
+- If the `gitlab_api` client-side tool extension is implemented, it is still part of the agent
   toolchain rather than orchestrator business logic.
 
 ## 12. Prompt Construction and Context Assembly
@@ -1234,6 +1276,8 @@ Inputs to prompt rendering:
 
 ### 12.2 Rendering Rules
 
+- The template engine and syntax are implementation-chosen per Section 5.4; only the strictness
+  and input-variable contract below are normative.
 - Render with strict variable checking.
 - Render with strict filter checking.
 - Convert issue object keys to strings for template compatibility.
@@ -1412,9 +1456,9 @@ Minimum endpoints:
       },
       "running": [
         {
-          "issue_id": "abc123",
-          "issue_identifier": "MT-649",
-          "issue_url": "https://tracker.example/issues/MT-649",
+          "issue_id": "12345678",
+          "issue_identifier": "#123",
+          "issue_url": "https://gitlab.example.com/group/project/-/issues/123",
           "state": "In Progress",
           "session_id": "thread-1-turn-1",
           "turn_count": 7,
@@ -1431,9 +1475,9 @@ Minimum endpoints:
       ],
       "retrying": [
         {
-          "issue_id": "def456",
-          "issue_identifier": "MT-650",
-          "issue_url": "https://tracker.example/issues/MT-650",
+          "issue_id": "12345679",
+          "issue_identifier": "#124",
+          "issue_url": "https://gitlab.example.com/group/project/-/issues/124",
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
@@ -1456,11 +1500,11 @@ Minimum endpoints:
 
     ```json
     {
-      "issue_identifier": "MT-649",
-      "issue_id": "abc123",
+      "issue_identifier": "#123",
+      "issue_id": "12345678",
       "status": "running",
       "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
+        "path": "/tmp/symphony_workspaces/_123"
       },
       "attempts": {
         "restart_count": 1,
@@ -1485,7 +1529,7 @@ Minimum endpoints:
         "codex_session_logs": [
           {
             "label": "latest",
-            "path": "/var/log/symphony/codex/MT-649/latest.log",
+            "path": "/var/log/symphony/codex/_123/latest.log",
             "url": null
           }
         ]
@@ -1537,7 +1581,7 @@ API design notes:
 1. `Workflow/Config Failures`
    - Missing `WORKFLOW.md`
    - Invalid YAML front matter
-   - Unsupported tracker kind or missing tracker credentials/project slug
+   - Unsupported tracker kind or missing tracker credentials/project_id
    - Missing coding-agent executable
 
 2. `Workspace Failures`
@@ -1556,8 +1600,8 @@ API design notes:
 
 4. `Tracker Failures`
    - API transport errors
-   - Non-200 status
-   - GraphQL errors
+   - Non-2xx status (including 429 rate limit)
+   - error response bodies
    - malformed payloads
 
 5. `Observability Failures`
@@ -1679,10 +1723,10 @@ Possible hardening measures include:
   of running with a maximally permissive configuration.
 - Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
   separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
+- Filtering which GitLab issues, projects, groups, labels, or other tracker sources are eligible for
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
-- Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
-  intended project scope, rather than exposing general workspace-wide tracker access.
+- Narrowing the `gitlab_api` tool so it can only read or mutate data inside the
+  intended project scope, rather than exposing general instance-wide tracker access.
 - Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
   available to the agent to the minimum needed for the workflow.
 
@@ -1956,7 +2000,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Invalid YAML front matter returns typed error
 - Front matter non-map returns typed error
 - Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
+- `tracker.kind` validation enforces currently supported kind (`gitlab`)
 - `tracker.api_key` works (including `$VAR` indirection)
 - `$VAR` resolution works for tracker API key and path values
 - `~` path expansion works
@@ -1982,15 +2026,16 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 
 ### 17.3 Issue Tracker Client
 
-- Candidate issue fetch uses active states and project slug
-- Linear query uses the specified project filter field (`slugId`)
+- Candidate issue fetch uses active states and project id
+- GitLab query uses the specified project path segment (`:id`) and `state=opened`
+- Workflow state is derived from scoped labels using `state_label_prefix`
 - Empty `fetch_issues_by_states([])` returns empty without API call
-- Pagination preserves order across multiple pages
-- Blockers are normalized from inverse relations of type `blocks`
+- Pagination preserves order across multiple pages (page-based, `per_page=100`)
+- Blockers are normalized from issue links of type `is_blocked_by`
 - Labels are normalized to lowercase
 - Issue state refresh by ID returns minimal normalized issues
-- Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
-- Error mapping for request errors, non-200, GraphQL errors, malformed payloads
+- Issue state refresh resolves `id` to `iid` and uses `iids[]` as specified in Section 11.2
+- Error mapping for request errors, non-2xx, error bodies, malformed payloads
 
 ### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
 
@@ -2033,10 +2078,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   targeted protocol
 - If client-side tools are implemented, session startup advertises the supported tool specs
   using the targeted app-server protocol
-- If the `linear_graphql` client-side tool extension is implemented:
+- If the `gitlab_api` client-side tool extension is implemented:
   - the tool is advertised to the session
-  - valid `query` / `variables` inputs execute against configured Linear auth
-  - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
+  - valid `method` / `path` / `query` / `body` inputs execute against configured GitLab auth
+  - non-2xx HTTP responses produce `success=false` while preserving the response body
   - invalid arguments, missing auth, and transport failures return structured failure payloads
   - unsupported tool names still fail without stalling the session
 
@@ -2065,8 +2110,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 These checks are RECOMMENDED for production readiness and MAY be skipped in CI when credentials,
 network access, or external service permissions are unavailable.
 
-- A real tracker smoke test can be run with valid credentials supplied by `LINEAR_API_KEY` or a
-  documented local bootstrap mechanism (for example `~/.linear_api_key`).
+- A real tracker smoke test can be run with valid credentials supplied by `GITLAB_TOKEN` or a
+  documented local bootstrap mechanism (for example `~/.gitlab_token`).
 - Real integration tests SHOULD use isolated test identifiers/workspaces and clean up tracker
   artifacts when practical.
 - A skipped real-integration test SHOULD be reported as skipped, not silently treated as passed.
@@ -2106,14 +2151,14 @@ Use the same validation profiles as Section 17:
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
+- `gitlab_api` client-side tool extension exposes raw GitLab REST access through the
   app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
 - TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
   of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
+- TODO: Add pluggable issue tracker adapters beyond GitLab.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)
 
