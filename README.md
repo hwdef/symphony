@@ -34,6 +34,12 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+### Option 3. Try the Go implementation
+
+This repository also contains a Go implementation under [`cmd/symphony`](cmd/symphony) and
+[`internal/symphony`](internal/symphony). See [docs/go-implementation.md](docs/go-implementation.md)
+for setup, workflow, and safety notes.
+
 ---
 
 ## License
